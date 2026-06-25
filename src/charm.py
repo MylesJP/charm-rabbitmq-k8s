@@ -1287,6 +1287,37 @@ USE_LONGNAME=true
                 self.amqp_provider.external_connectivity(relation)
             )
 
+    def _update_amqp_relation_password(
+        self, username: str, password: str
+    ) -> None:
+        """Sync the regenerated password to matching amqp relations.
+
+        After credentials are regenerated (e.g. via get-service-account),
+        the peers data bag holds the new password but the amqp relation
+        app data bag is never updated, leaving CMR consumers with stale
+        credentials. Only the leader writes app data on the amqp relation.
+        """
+        if not self.unit.is_leader():
+            return
+        for relation in self.model.relations[AMQP_RELATION]:
+            try:
+                rel_username = self.amqp_provider.username(relation)
+            except ops.ModelError:
+                logger.debug(
+                    f"Fail to read username: rel={relation.name} "
+                    f"rel_id={relation.id}, skipping",
+                    exc_info=True,
+                )
+                continue
+            if rel_username != username:
+                continue
+            if relation.data[self.app].get("password") != password:
+                logger.debug(
+                    f"Updating password on amqp relation {relation.id} "
+                    f"for {username}"
+                )
+                relation.data[self.app]["password"] = password
+
     def _get_service_account(self, event: ActionEvent) -> None:
         """Get/create service account details for access to RabbitMQ.
 
@@ -1309,6 +1340,7 @@ USE_LONGNAME=true
                 self.peers.store_password(username, password)
             password = self.peers.retrieve_password(username)
             self.set_user_permissions(username, vhost)
+            self._update_amqp_relation_password(username, password)
 
             event.set_results(
                 {

@@ -65,6 +65,7 @@ def _fake_charm(**kwargs):
         "does_user_exist": Mock(return_value=True),
         "create_user": Mock(return_value="new-password"),
         "set_user_permissions": Mock(),
+        "_update_amqp_relation_password": Mock(),
         "_on_update_status": Mock(),
         "generate_nodename": lambda unit_name: charm.RabbitMQOperatorCharm.generate_nodename(
             SimpleNamespace(app=SimpleNamespace(name="rabbitmq-k8s")),
@@ -1200,3 +1201,153 @@ def test_reconcile_lb_reconciles_valid_service():
     charm.RabbitMQOperatorCharm._reconcile_lb(fake, None)
 
     resource_manager.reconcile.assert_called_once_with([service])
+
+
+def test_update_amqp_relation_password_non_leader_noop():
+    """Non-leaders never write the amqp app data bag."""
+    fake = _fake_charm(
+        unit=Mock(is_leader=Mock(return_value=False)),
+        amqp_provider=SimpleNamespace(username=Mock()),
+    )
+
+    charm.RabbitMQOperatorCharm._update_amqp_relation_password(
+        fake, "svc-user", "new-password"
+    )
+
+    fake.amqp_provider.username.assert_not_called()
+
+
+def test_update_amqp_relation_password_updates_matching_relation():
+    """A matching amqp relation gets the new password written to its app bag."""
+    app = object()
+    databag = {"password": "old-password", "username": "svc-user"}
+    relation = SimpleNamespace(
+        active=True,
+        data={app: databag},
+        name="amqp",
+        id=1,
+    )
+    amqp_provider = SimpleNamespace(username=Mock(return_value="svc-user"))
+    unit = Mock()
+    unit.is_leader.return_value = True
+    fake = _fake_charm(
+        app=app,
+        model=SimpleNamespace(
+            relations={charm.AMQP_RELATION: [relation]}, unit=unit
+        ),
+        amqp_provider=amqp_provider,
+    )
+
+    charm.RabbitMQOperatorCharm._update_amqp_relation_password(
+        fake, "svc-user", "new-password"
+    )
+
+    assert databag["password"] == "new-password"
+
+
+def test_update_amqp_relation_password_skips_non_matching_relation():
+    """Relations for a different username are left untouched."""
+    app = object()
+    databag = {"password": "old-password", "username": "other-user"}
+    relation = SimpleNamespace(
+        active=True,
+        data={app: databag},
+        name="amqp",
+        id=1,
+    )
+    amqp_provider = SimpleNamespace(username=Mock(return_value="other-user"))
+    unit = Mock()
+    unit.is_leader.return_value = True
+    fake = _fake_charm(
+        app=app,
+        model=SimpleNamespace(
+            relations={charm.AMQP_RELATION: [relation]}, unit=unit
+        ),
+        amqp_provider=amqp_provider,
+    )
+
+    charm.RabbitMQOperatorCharm._update_amqp_relation_password(
+        fake, "svc-user", "new-password"
+    )
+
+    assert databag["password"] == "old-password"
+
+
+def test_update_amqp_relation_password_skips_when_already_synced():
+    """No write happens when the relation already holds the new password."""
+    app = object()
+    databag = {"password": "new-password", "username": "svc-user"}
+    relation = SimpleNamespace(
+        active=True,
+        data={app: databag},
+        name="amqp",
+        id=1,
+    )
+    amqp_provider = SimpleNamespace(username=Mock(return_value="svc-user"))
+    unit = Mock()
+    unit.is_leader.return_value = True
+    fake = _fake_charm(
+        app=app,
+        model=SimpleNamespace(
+            relations={charm.AMQP_RELATION: [relation]}, unit=unit
+        ),
+        amqp_provider=amqp_provider,
+    )
+
+    charm.RabbitMQOperatorCharm._update_amqp_relation_password(
+        fake, "svc-user", "new-password"
+    )
+
+    assert databag == {"password": "new-password", "username": "svc-user"}
+
+
+def test_update_amqp_relation_password_handles_model_error():
+    """Model errors while reading username are skipped, not raised."""
+    app = object()
+    databag = {"password": "old-password"}
+    relation = SimpleNamespace(
+        active=True,
+        data={app: databag},
+        name="amqp",
+        id=1,
+    )
+    amqp_provider = SimpleNamespace(
+        username=Mock(side_effect=ops.model.ModelError("denied"))
+    )
+    unit = Mock()
+    unit.is_leader.return_value = True
+    fake = _fake_charm(
+        app=app,
+        model=SimpleNamespace(
+            relations={charm.AMQP_RELATION: [relation]}, unit=unit
+        ),
+        amqp_provider=amqp_provider,
+    )
+
+    charm.RabbitMQOperatorCharm._update_amqp_relation_password(
+        fake, "svc-user", "new-password"
+    )
+
+    assert databag["password"] == "old-password"
+
+
+def test_get_service_account_syncs_password_to_amqp_relation():
+    """Service-account action propagates the password to amqp relations."""
+    event = Mock()
+    event.params = {"username": "svc-user", "vhost": "svc-vhost"}
+    peers = SimpleNamespace(
+        store_password=Mock(),
+        retrieve_password=Mock(return_value="svc-password"),
+    )
+    fake = _fake_charm(peers=peers)
+    fake.rabbit_running = True
+    fake.ingress_address = "10.5.0.1"
+    fake.rabbitmq_url = Mock(return_value="rabbit://svc-user:svc-password")
+    fake.does_vhost_exist.return_value = True
+    fake.does_user_exist.return_value = False
+
+    charm.RabbitMQOperatorCharm._get_service_account(fake, event)
+
+    fake._update_amqp_relation_password.assert_called_once_with(
+        "svc-user", "svc-password"
+    )
