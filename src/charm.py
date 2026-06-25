@@ -611,10 +611,42 @@ class RabbitMQOperatorCharm(CharmBase):
 
         api = self._get_admin_api()
         username = self.amqp_provider.username(event.relation)
-        if username and self.does_user_exist(username):
+        if not username:
+            return
+
+        if self._is_amqp_username_in_use_elsewhere(username, event.relation):
+            logger.debug(
+                f"User {username} still in use on another amqp relation, "
+                f"keeping credentials"
+            )
+            return
+
+        if self.does_user_exist(username):
             api.delete_user(username)
 
         self.peers.delete_user(username)
+
+    def _is_amqp_username_in_use_elsewhere(
+        self, username: str, exclude: ops.Relation
+    ) -> bool:
+        """Return True if another active amqp relation requests username."""
+        for relation in self.model.relations[AMQP_RELATION]:
+            if relation.id == exclude.id:
+                continue
+            if not relation.active:
+                continue
+            try:
+                rel_username = self.amqp_provider.username(relation)
+            except ops.ModelError:
+                logger.debug(
+                    f"Fail to read username: rel={relation.name} "
+                    f"rel_id={relation.id}, skipping",
+                    exc_info=True,
+                )
+                continue
+            if rel_username == username:
+                return True
+        return False
 
     def _on_pebble_custom_notice(self, event: PebbleCustomNoticeEvent):
         """Handle pebble custom notice event."""

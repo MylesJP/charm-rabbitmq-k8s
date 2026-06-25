@@ -734,7 +734,7 @@ def test_on_gone_away_amqp_clients_non_leader_noop():
 
 def test_on_gone_away_amqp_clients_leader_deletes_user():
     """Leaders clean up the user and peer password on AMQP relation removal."""
-    relation = Mock()
+    relation = SimpleNamespace(id=1, active=True)
     event = SimpleNamespace(relation=relation)
     admin_api = Mock()
     peers = SimpleNamespace(delete_user=Mock())
@@ -746,12 +746,189 @@ def test_on_gone_away_amqp_clients_leader_deletes_user():
         amqp_provider=SimpleNamespace(username=Mock(return_value="svc-user")),
         does_user_exist=Mock(return_value=True),
         peers=peers,
+        model=SimpleNamespace(relations={charm.AMQP_RELATION: []}),
     )
+    fake._is_amqp_username_in_use_elsewhere = Mock(return_value=False)
 
     charm.RabbitMQOperatorCharm._on_gone_away_amqp_clients(fake, event)
 
     admin_api.delete_user.assert_called_once_with("svc-user")
     peers.delete_user.assert_called_once_with("svc-user")
+
+
+def test_on_gone_away_amqp_clients_keeps_user_when_shared():
+    """User is kept when another active amqp relation uses the same username."""
+    breaking = SimpleNamespace(id=1, active=True)
+    surviving = SimpleNamespace(id=2, active=True)
+    event = SimpleNamespace(relation=breaking)
+    admin_api = Mock()
+    peers = SimpleNamespace(delete_user=Mock())
+    unit = Mock()
+    unit.is_leader.return_value = True
+    fake = _fake_charm(
+        unit=unit,
+        _get_admin_api=Mock(return_value=admin_api),
+        amqp_provider=SimpleNamespace(username=Mock(return_value="svc-user")),
+        does_user_exist=Mock(return_value=True),
+        peers=peers,
+        model=SimpleNamespace(
+            relations={charm.AMQP_RELATION: [breaking, surviving]}
+        ),
+    )
+    fake._is_amqp_username_in_use_elsewhere = Mock(return_value=True)
+
+    charm.RabbitMQOperatorCharm._on_gone_away_amqp_clients(fake, event)
+
+    admin_api.delete_user.assert_not_called()
+    peers.delete_user.assert_not_called()
+
+
+def test_on_gone_away_amqp_clients_deletes_when_other_relation_differs():
+    """User is deleted when surviving relations use a different username."""
+    breaking = SimpleNamespace(id=1, active=True)
+    surviving = SimpleNamespace(id=2, active=True)
+    event = SimpleNamespace(relation=breaking)
+    admin_api = Mock()
+    peers = SimpleNamespace(delete_user=Mock())
+    unit = Mock()
+    unit.is_leader.return_value = True
+    username_mock = Mock(side_effect=["svc-user", "other-user"])
+    fake = _fake_charm(
+        unit=unit,
+        _get_admin_api=Mock(return_value=admin_api),
+        amqp_provider=SimpleNamespace(username=username_mock),
+        does_user_exist=Mock(return_value=True),
+        peers=peers,
+        model=SimpleNamespace(
+            relations={charm.AMQP_RELATION: [breaking, surviving]}
+        ),
+    )
+    fake._is_amqp_username_in_use_elsewhere = Mock(return_value=False)
+
+    charm.RabbitMQOperatorCharm._on_gone_away_amqp_clients(fake, event)
+
+    admin_api.delete_user.assert_called_once_with("svc-user")
+    peers.delete_user.assert_called_once_with("svc-user")
+
+
+def test_on_gone_away_amqp_clients_no_username_noop():
+    """No action when the broken relation has no username set."""
+    relation = SimpleNamespace(id=1, active=True)
+    event = SimpleNamespace(relation=relation)
+    admin_api = Mock()
+    peers = SimpleNamespace(delete_user=Mock())
+    unit = Mock()
+    unit.is_leader.return_value = True
+    fake = _fake_charm(
+        unit=unit,
+        _get_admin_api=Mock(return_value=admin_api),
+        amqp_provider=SimpleNamespace(username=Mock(return_value=None)),
+        does_user_exist=Mock(return_value=True),
+        peers=peers,
+        model=SimpleNamespace(relations={charm.AMQP_RELATION: []}),
+    )
+
+    charm.RabbitMQOperatorCharm._on_gone_away_amqp_clients(fake, event)
+
+    admin_api.delete_user.assert_not_called()
+    peers.delete_user.assert_not_called()
+
+
+def test_is_amqp_username_in_use_elsewhere_true_when_shared():
+    """Returns True when a surviving relation uses the same username."""
+    breaking = SimpleNamespace(id=1, active=True)
+    surviving = SimpleNamespace(id=2, active=True)
+    unrelated = SimpleNamespace(id=3, active=True)
+    amqp_provider = SimpleNamespace(
+        username=Mock(side_effect=["svc-user", "other-user"])
+    )
+    fake = _fake_charm(
+        amqp_provider=amqp_provider,
+        model=SimpleNamespace(
+            relations={charm.AMQP_RELATION: [breaking, surviving, unrelated]}
+        ),
+    )
+
+    result = charm.RabbitMQOperatorCharm._is_amqp_username_in_use_elsewhere(
+        fake, "svc-user", breaking
+    )
+
+    assert result is True
+
+
+def test_is_amqp_username_in_use_elsewhere_false_when_not_shared():
+    """Returns False when no surviving relation uses the same username."""
+    breaking = SimpleNamespace(id=1, active=True)
+    surviving = SimpleNamespace(id=2, active=True)
+    amqp_provider = SimpleNamespace(username=Mock(return_value="other-user"))
+    fake = _fake_charm(
+        amqp_provider=amqp_provider,
+        model=SimpleNamespace(
+            relations={charm.AMQP_RELATION: [breaking, surviving]}
+        ),
+    )
+
+    result = charm.RabbitMQOperatorCharm._is_amqp_username_in_use_elsewhere(
+        fake, "svc-user", breaking
+    )
+
+    assert result is False
+
+
+def test_is_amqp_username_in_use_elsewhere_false_when_alone():
+    """Returns False when the broken relation is the only amqp relation."""
+    breaking = SimpleNamespace(id=1, active=True)
+    fake = _fake_charm(
+        amqp_provider=SimpleNamespace(username=Mock()),
+        model=SimpleNamespace(relations={charm.AMQP_RELATION: [breaking]}),
+    )
+
+    result = charm.RabbitMQOperatorCharm._is_amqp_username_in_use_elsewhere(
+        fake, "svc-user", breaking
+    )
+
+    assert result is False
+    fake.amqp_provider.username.assert_not_called()
+
+
+def test_is_amqp_username_in_use_elsewhere_skips_inactive():
+    """Inactive relations are not counted as in use."""
+    breaking = SimpleNamespace(id=1, active=True)
+    inactive = SimpleNamespace(id=2, active=False)
+    amqp_provider = SimpleNamespace(username=Mock(return_value="svc-user"))
+    fake = _fake_charm(
+        amqp_provider=amqp_provider,
+        model=SimpleNamespace(
+            relations={charm.AMQP_RELATION: [breaking, inactive]}
+        ),
+    )
+
+    result = charm.RabbitMQOperatorCharm._is_amqp_username_in_use_elsewhere(
+        fake, "svc-user", breaking
+    )
+
+    assert result is False
+
+
+def test_is_amqp_username_in_use_elsewhere_handles_model_error():
+    """Model errors while reading username are skipped, not raised."""
+    breaking = SimpleNamespace(id=1, active=True, name="amqp")
+    surviving = SimpleNamespace(id=2, active=True, name="amqp")
+    amqp_provider = SimpleNamespace(
+        username=Mock(side_effect=ops.model.ModelError("denied"))
+    )
+    fake = _fake_charm(
+        amqp_provider=amqp_provider,
+        model=SimpleNamespace(
+            relations={charm.AMQP_RELATION: [breaking, surviving]}
+        ),
+    )
+
+    result = charm.RabbitMQOperatorCharm._is_amqp_username_in_use_elsewhere(
+        fake, "svc-user", breaking
+    )
+
+    assert result is False
 
 
 def test_does_user_exist_false_on_404():
