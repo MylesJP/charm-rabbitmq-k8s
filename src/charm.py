@@ -611,10 +611,42 @@ class RabbitMQOperatorCharm(CharmBase):
 
         api = self._get_admin_api()
         username = self.amqp_provider.username(event.relation)
-        if username and self.does_user_exist(username):
+        if not username:
+            return
+
+        if self._is_amqp_username_in_use_elsewhere(username, event.relation):
+            logger.debug(
+                f"User {username} still in use on another amqp relation, "
+                f"keeping credentials"
+            )
+            return
+
+        if self.does_user_exist(username):
             api.delete_user(username)
 
         self.peers.delete_user(username)
+
+    def _is_amqp_username_in_use_elsewhere(
+        self, username: str, exclude: ops.Relation
+    ) -> bool:
+        """Return True if another active amqp relation requests username."""
+        for relation in self.model.relations[AMQP_RELATION]:
+            if relation.id == exclude.id:
+                continue
+            if not relation.active:
+                continue
+            try:
+                rel_username = self.amqp_provider.username(relation)
+            except ops.ModelError:
+                logger.debug(
+                    f"Fail to read username: rel={relation.name} "
+                    f"rel_id={relation.id}, skipping",
+                    exc_info=True,
+                )
+                continue
+            if rel_username == username:
+                return True
+        return False
 
     def _on_pebble_custom_notice(self, event: PebbleCustomNoticeEvent):
         """Handle pebble custom notice event."""
@@ -1287,6 +1319,37 @@ USE_LONGNAME=true
                 self.amqp_provider.external_connectivity(relation)
             )
 
+    def _update_amqp_relation_password(
+        self, username: str, password: str
+    ) -> None:
+        """Sync the regenerated password to matching amqp relations.
+
+        After credentials are regenerated (e.g. via get-service-account),
+        the peers data bag holds the new password but the amqp relation
+        app data bag is never updated, leaving CMR consumers with stale
+        credentials. Only the leader writes app data on the amqp relation.
+        """
+        if not self.unit.is_leader():
+            return
+        for relation in self.model.relations[AMQP_RELATION]:
+            try:
+                rel_username = self.amqp_provider.username(relation)
+            except ops.ModelError:
+                logger.debug(
+                    f"Fail to read username: rel={relation.name} "
+                    f"rel_id={relation.id}, skipping",
+                    exc_info=True,
+                )
+                continue
+            if rel_username != username:
+                continue
+            if relation.data[self.app].get("password") != password:
+                logger.debug(
+                    f"Updating password on amqp relation {relation.id} "
+                    f"for {username}"
+                )
+                relation.data[self.app]["password"] = password
+
     def _get_service_account(self, event: ActionEvent) -> None:
         """Get/create service account details for access to RabbitMQ.
 
@@ -1309,6 +1372,7 @@ USE_LONGNAME=true
                 self.peers.store_password(username, password)
             password = self.peers.retrieve_password(username)
             self.set_user_permissions(username, vhost)
+            self._update_amqp_relation_password(username, password)
 
             event.set_results(
                 {
